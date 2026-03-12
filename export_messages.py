@@ -98,14 +98,14 @@ def resolve_username(chat_name, contacts):
 
 
 def get_all_msg_dbs(decrypted_dir):
-    """Find all message_N.db files (N = 0, 1, 2, ...)."""
+    """Find all message_N.db or biz_message_N.db files (N = 0, 1, 2, ...)."""
     import re
     msg_dir = os.path.join(decrypted_dir, "message")
     if not os.path.isdir(msg_dir):
         return []
     dbs = []
     for f in sorted(os.listdir(msg_dir)):
-        if re.match(r"^message_\d+\.db$", f):
+        if re.match(r"^(biz_)?message_\d+\.db$", f):
             dbs.append(os.path.join(msg_dir, f))
     return dbs
 
