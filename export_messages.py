@@ -249,7 +249,7 @@ def list_conversations(msg_dbs, session_db_path, contacts):
     return results
 
 
-def export_chat(msg_dbs, username, contacts, limit=None):
+def export_chat(msg_dbs, username, contacts, limit=None, since_ts=None, until_ts=None):
     """Export messages for a specific conversation from all message DBs."""
     table = username_to_table(username)
     is_group = "@chatroom" in username
@@ -263,18 +263,32 @@ def export_chat(msg_dbs, username, contacts, limit=None):
     try:
         total = conn.execute(f"SELECT count(*) FROM [{table}]").fetchone()[0]
 
-        query = (
-            f"SELECT local_id, local_type, create_time, real_sender_id, "
-            f"message_content, source FROM [{table}] ORDER BY create_time ASC"
-        )
-        if limit:
+        where_clauses = []
+        params = []
+        if since_ts is not None:
+            where_clauses.append("create_time >= ?")
+            params.append(since_ts)
+        if until_ts is not None:
+            where_clauses.append("create_time <= ?")
+            params.append(until_ts)
+        where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+
+        if limit and not where_clauses:
             query = (
                 f"SELECT * FROM (SELECT local_id, local_type, create_time, "
                 f"real_sender_id, message_content, source FROM [{table}] "
                 f"ORDER BY create_time DESC LIMIT {limit}) ORDER BY create_time ASC"
             )
+            rows = conn.execute(query).fetchall()
+        else:
+            query = (
+                f"SELECT local_id, local_type, create_time, real_sender_id, "
+                f"message_content, source FROM [{table}] {where_sql} ORDER BY create_time ASC"
+            )
+            if limit:
+                query += f" LIMIT {limit}"
+            rows = conn.execute(query, params).fetchall()
 
-        rows = conn.execute(query).fetchall()
         lines = [format_message(r, is_group, contacts) for r in rows]
 
         display_name = contacts.get(username, username)
@@ -297,11 +311,14 @@ def safe_filename(display_name, username):
     return name
 
 
-def export_to_file(msg_dbs, username, output_dir, contacts, limit=None):
+def export_to_file(msg_dbs, username, output_dir, contacts, limit=None, since_ts=None, until_ts=None):
     """Export messages to a text file named by display name."""
-    lines, info = export_chat(msg_dbs, username, contacts, limit)
+    lines, info = export_chat(msg_dbs, username, contacts, limit, since_ts, until_ts)
     if lines is None:
         return False, info
+
+    if not lines:
+        return False, f"skipped (no messages in range) | {info}"
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -340,7 +357,30 @@ def main():
     parser.add_argument(
         "-s", "--search", help="Search keyword across all conversations",
     )
+    parser.add_argument(
+        "--since", help="Start date (inclusive), format: YYYY-MM-DD",
+    )
+    parser.add_argument(
+        "--until", help="End date (inclusive), format: YYYY-MM-DD (default: today)",
+    )
+    parser.add_argument(
+        "--personal", action="store_true",
+        help="Only export personal chats and groups (exclude public accounts starting with gh_)",
+    )
     args = parser.parse_args()
+
+    # Parse date range into Unix timestamps
+    since_ts = None
+    until_ts = None
+    if args.since:
+        since_ts = int(datetime.strptime(args.since, "%Y-%m-%d").timestamp())
+    if args.until:
+        from datetime import timedelta
+        until_ts = int((datetime.strptime(args.until, "%Y-%m-%d") + timedelta(days=1)).timestamp()) - 1
+    elif args.since:
+        # if --since given but no --until, default until = end of today
+        from datetime import timedelta
+        until_ts = int((datetime.now().replace(hour=23, minute=59, second=59, microsecond=0)).timestamp())
 
     # Load databases
     msg_dbs = get_all_msg_dbs(args.dir)
@@ -371,11 +411,20 @@ def main():
                 ).fetchone()[0]
                 if not exists:
                     continue
+                extra_where = []
+                extra_params = [f"%{args.search}%"]
+                if since_ts is not None:
+                    extra_where.append("create_time >= ?")
+                    extra_params.append(since_ts)
+                if until_ts is not None:
+                    extra_where.append("create_time <= ?")
+                    extra_params.append(until_ts)
+                date_sql = (" AND " + " AND ".join(extra_where)) if extra_where else ""
                 rows = conn.execute(
                     f"SELECT local_id, local_type, create_time, real_sender_id, "
                     f"message_content, source FROM [{table}] "
-                    f"WHERE message_content LIKE ? ORDER BY create_time DESC LIMIT 10",
-                    (f"%{args.search}%",),
+                    f"WHERE message_content LIKE ?{date_sql} ORDER BY create_time DESC LIMIT 10",
+                    extra_params,
                 ).fetchall()
                 if rows:
                     display = contacts.get(username, username)
@@ -400,7 +449,7 @@ def main():
             display = contacts.get(username, username)
             print(f"[*] Matched '{args.chat}' -> {display} ({username})")
 
-        lines, info = export_chat(msg_dbs, username, contacts, args.limit)
+        lines, info = export_chat(msg_dbs, username, contacts, args.limit, since_ts, until_ts)
         if lines is None:
             print(f"[-] {info}")
             sys.exit(1)
@@ -409,7 +458,7 @@ def main():
         for line in lines:
             print(line)
 
-        success, result_info = export_to_file(msg_dbs, username, args.output, contacts, args.limit)
+        success, result_info = export_to_file(msg_dbs, username, args.output, contacts, args.limit, since_ts, until_ts)
         print(f"\n[*] Saved: {result_info}")
 
     elif args.all:
@@ -417,15 +466,21 @@ def main():
         convos = list_conversations(msg_dbs, session_db, contacts)
         os.makedirs(args.output, exist_ok=True)
         exported = 0
+        skipped = 0
         for c in convos:
             if not c["has_msgs"]:
                 continue
+            if args.personal and c["username"].startswith("gh_"):
+                skipped += 1
+                continue
             success, info = export_to_file(
-                msg_dbs, c["username"], args.output, contacts, args.limit,
+                msg_dbs, c["username"], args.output, contacts, args.limit, since_ts, until_ts,
             )
             if success:
                 print(f"  ✅ {info}")
                 exported += 1
+        if skipped:
+            print(f"[*] Skipped {skipped} public accounts (gh_*)")
         print(f"\n[*] Exported {exported} conversations to {args.output}/")
 
     else:
