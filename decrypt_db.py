@@ -24,16 +24,42 @@ PAGE_SZ = 4096
 SALT_SZ = 16
 
 
-def find_db_dir():
+def find_db_dir(keys_data=None):
+    # Prefer the db_dir recorded by the scanner
+    if keys_data and "__db_dir__" in keys_data:
+        d = keys_data["__db_dir__"]
+        if os.path.isdir(d):
+            return d
+
     pattern = os.path.join(DB_DIR, "*", "db_storage")
     candidates = glob.glob(pattern)
-    if len(candidates) == 1:
-        return candidates[0]
-    if len(candidates) > 1:
-        return candidates[0]
-    if os.path.isdir(DB_DIR) and os.path.basename(DB_DIR) == "db_storage":
-        return DB_DIR
-    return None
+    if not candidates:
+        if os.path.isdir(DB_DIR) and os.path.basename(DB_DIR) == "db_storage":
+            return DB_DIR
+        return None
+
+    # Detect active WeChat account via lsof
+    try:
+        import subprocess
+        proc = subprocess.Popen(
+            ["lsof", "-c", "WeChat", "-F", "n"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True
+        )
+        for line in proc.stdout:
+            if "xwechat_files/wxid_" in line:
+                part = line.split("xwechat_files/")[1]
+                wxid = part.split("/")[0]
+                for c in candidates:
+                    if wxid in c:
+                        proc.kill()
+                        proc.wait()
+                        return c
+        proc.kill()
+        proc.wait()
+    except Exception:
+        pass
+
+    return candidates[0]
 
 
 def find_sqlcipher():
@@ -112,7 +138,7 @@ def main():
         sys.exit(1)
     print(f"[*] Using sqlcipher: {sqlcipher_bin}")
 
-    db_dir = find_db_dir()
+    db_dir = find_db_dir(data)
     if not db_dir:
         print(f"[-] Could not find db_storage directory under {DB_DIR}")
         sys.exit(1)

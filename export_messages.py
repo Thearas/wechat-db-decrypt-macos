@@ -21,6 +21,19 @@ import argparse
 import glob
 from datetime import datetime
 
+try:
+    import zstandard as _zstd
+    _ZSTD_DCTX = _zstd.ZstdDecompressor()
+except ImportError:
+    _ZSTD_DCTX = None
+
+try:
+    import xml.etree.ElementTree as ET
+except ImportError:
+    ET = None
+
+ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+
 
 DECRYPTED_DIR = "decrypted"
 MSG_TYPE_MAP = {
@@ -158,6 +171,96 @@ def collect_all_usernames(msg_dbs):
 # ── Message formatting ───────────────────────────────────────────────────────
 
 
+def decompress_content(content):
+    """Decompress zstd-compressed content if applicable."""
+    if isinstance(content, bytes) and content[:4] == ZSTD_MAGIC:
+        if _ZSTD_DCTX is None:
+            return "(zstd compressed — install zstandard: pip install zstandard)"
+        try:
+            return _ZSTD_DCTX.decompress(content).decode("utf-8", errors="replace")
+        except Exception:
+            return content.decode("utf-8", errors="replace")
+    if isinstance(content, bytes):
+        return content.decode("utf-8", errors="replace")
+    return content or ""
+
+
+def _xml_text(elem, tag):
+    """Get stripped text of a child tag, or empty string."""
+    child = elem.find(tag)
+    return (child.text or "").strip() if child is not None else ""
+
+
+def parse_appmsg(xml_str, contacts):
+    """Parse an appmsg XML block and return a human-readable string."""
+    if ET is None:
+        return xml_str[:200]
+    try:
+        root = ET.fromstring(xml_str)
+    except ET.ParseError:
+        # Try to extract title with regex as fallback
+        m = re.search(r"<title>(.*?)</title>", xml_str, re.DOTALL)
+        return m.group(1).strip() if m else xml_str[:200]
+
+    appmsg = root.find("appmsg")
+    if appmsg is None:
+        return xml_str[:200]
+
+    appmsg_type = _xml_text(appmsg, "type")
+    title = _xml_text(appmsg, "title")
+
+    # type 57 = reply/quote message
+    if appmsg_type == "57":
+        refermsg = appmsg.find("refermsg")
+        if refermsg is not None:
+            ref_type = _xml_text(refermsg, "type")
+            ref_sender = _xml_text(refermsg, "chatusr")
+            ref_display = _xml_text(refermsg, "displayname")
+            ref_content = _xml_text(refermsg, "content")
+            # Resolve sender name
+            ref_name = contacts.get(ref_sender, ref_display or ref_sender)
+            # Summarize quoted content
+            if ref_type == "3":
+                ref_summary = "[图片]"
+            elif ref_type == "43":
+                ref_summary = "[视频]"
+            elif ref_type == "34":
+                ref_summary = "[语音]"
+            elif ref_content:
+                # ref_content may itself be XML
+                if ref_content.startswith("<?xml") or ref_content.startswith("<msg"):
+                    m = re.search(r"<title>(.*?)</title>", ref_content, re.DOTALL)
+                    ref_summary = m.group(1).strip() if m else "[消息]"
+                else:
+                    ref_summary = ref_content[:80]
+            else:
+                ref_summary = "[消息]"
+            return f"{title} [引用 {ref_name}: {ref_summary}]"
+        return title
+
+    # type 5 = link
+    if appmsg_type == "5":
+        url = _xml_text(appmsg, "url")
+        des = _xml_text(appmsg, "des")
+        if url:
+            return f"[链接] {title}" + (f" — {des[:60]}" if des else "") + f" {url[:80]}"
+        return f"[链接] {title}"
+
+    # type 6 = file
+    if appmsg_type == "6":
+        des = _xml_text(appmsg, "des")
+        return f"[文件] {title}" + (f" ({des})" if des else "")
+
+    # type 33 = mini program
+    if appmsg_type == "33":
+        return f"[小程序] {title}"
+
+    # fallback: show title if available
+    if title:
+        return f"[应用消息] {title}"
+    return f"[应用消息 type={appmsg_type}]"
+
+
 def format_message(row, is_group, contacts):
     """Format a single message row for display."""
     local_id, local_type, create_time, sender_id, content, source = row
@@ -166,24 +269,45 @@ def format_message(row, is_group, contacts):
     type_name = MSG_TYPE_MAP.get(local_type, f"type:{local_type}")
 
     sender = ""
-    body = content or ""
-
-    # Handle bytes content (e.g. zstd compressed)
-    if isinstance(body, bytes):
-        try:
-            body = body.decode("utf-8", errors="replace")
-        except Exception:
-            body = "(binary content)"
+    body = decompress_content(content)
 
     if is_group and body and ":\n" in body:
         parts = body.split(":\n", 1)
         raw_sender = parts[0]
         body = parts[1]
-        # Resolve sender name
         sender = contacts.get(raw_sender, raw_sender)
 
-    if local_type != 1:
-        body = f"[{type_name}] {body[:100]}" if body else f"[{type_name}]"
+    # Parse XML appmsg content (type 49 or high-bit composite types)
+    body_stripped = body.strip()
+
+    # System messages with XML (revoke, etc.)
+    if local_type in (10000, 10002) and (body_stripped.startswith("<?xml") or body_stripped.startswith("<msg")):
+        try:
+            root = ET.fromstring(body_stripped) if ET else None
+            if root is not None:
+                sysmsg = root.find("revokemsg")
+                if sysmsg is not None:
+                    body = _xml_text(sysmsg, "content") or body_stripped[:100]
+                else:
+                    body = body_stripped[:100]
+        except Exception:
+            body = body_stripped[:100]
+    elif body_stripped.startswith("<?xml") or body_stripped.startswith("<msg"):
+        # Image messages stored as XML
+        if "<img " in body_stripped or "<img\n" in body_stripped:
+            body = "[图片]"
+        else:
+            body = parse_appmsg(body_stripped, contacts)
+    elif local_type != 1 and local_type not in (10000, 10002):
+        # Non-text, non-system message with plain content
+        if local_type not in MSG_TYPE_MAP:
+            # Unknown composite type — try XML parse
+            if "<appmsg" in body:
+                body = parse_appmsg(body_stripped, contacts)
+            else:
+                body = f"[{type_name}] {body[:100]}" if body else f"[{type_name}]"
+        else:
+            body = f"[{type_name}] {body[:100]}" if body else f"[{type_name}]"
 
     if sender:
         return f"[{ts}] {sender}: {body}"

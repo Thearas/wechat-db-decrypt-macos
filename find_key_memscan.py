@@ -35,57 +35,93 @@ KEY_SZ = 32
 SALT_SZ = 16
 OUTPUT_FILE = "wechat_keys.json"
 
-# Regex to match x'<hex>' patterns in memory (96 hex chars = 64 key + 32 salt)
+# Regex to match x'<hex>' patterns in memory (64-192 hex chars)
 HEX_PATTERN = re.compile(rb"x'([0-9a-fA-F]{64,192})'")
 
 
-def find_db_dir():
+def find_db_dirs(pid=None):
+    """Return all db_storage dirs, with the active account's dir first."""
     pattern = os.path.join(DB_DIR, "*", "db_storage")
     candidates = glob.glob(pattern)
-    if candidates:
-        return candidates[0]
-    return None
+    if not candidates:
+        return []
+
+    # Try to detect the active account from the process's open files
+    active_wxid = None
+    if pid:
+        try:
+            import subprocess
+            proc = subprocess.Popen(
+                ["lsof", "-c", "WeChat", "-F", "n"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True
+            )
+            for line in proc.stdout:
+                if "xwechat_files/wxid_" in line:
+                    part = line.split("xwechat_files/")[1]
+                    active_wxid = part.split("/")[0]
+                    break
+            proc.kill()
+            proc.wait()
+        except Exception:
+            pass
+
+    if active_wxid:
+        active = [c for c in candidates if active_wxid in c]
+        rest = [c for c in candidates if active_wxid not in c]
+        return active + rest
+
+    return candidates
 
 
-def collect_db_files(db_dir):
-    """Collect all .db files with their first page and salt."""
+def collect_db_files(db_dirs):
+    """Collect all .db files with their first page and salt from multiple dirs."""
     db_files = []
     salt_to_dbs = {}
 
-    for root, dirs, files in os.walk(db_dir):
-        for f in files:
-            if not f.endswith(".db"):
-                continue
-            if f.endswith("-wal") or f.endswith("-shm"):
-                continue
-            path = os.path.join(root, f)
-            rel = os.path.relpath(path, db_dir)
-            sz = os.path.getsize(path)
-            if sz < PAGE_SZ:
-                continue
-            with open(path, "rb") as fh:
-                page1 = fh.read(PAGE_SZ)
-            salt = page1[:SALT_SZ].hex()
-            db_files.append((rel, path, sz, salt, page1))
-            salt_to_dbs.setdefault(salt, []).append(rel)
+    if isinstance(db_dirs, str):
+        db_dirs = [db_dirs]
+
+    for db_dir in db_dirs:
+        for root, dirs, files in os.walk(db_dir):
+            for f in files:
+                if not f.endswith(".db"):
+                    continue
+                if f.endswith("-wal") or f.endswith("-shm"):
+                    continue
+                path = os.path.join(root, f)
+                rel = os.path.relpath(path, db_dir)
+                sz = os.path.getsize(path)
+                if sz < PAGE_SZ:
+                    continue
+                with open(path, "rb") as fh:
+                    page1 = fh.read(PAGE_SZ)
+                salt = page1[:SALT_SZ].hex()
+                db_files.append((rel, path, sz, salt, page1))
+                salt_to_dbs.setdefault(salt, []).append(rel)
 
     return db_files, salt_to_dbs
 
 
 def verify_key_for_db(enc_key_bytes, db_page1):
-    """Verify enc_key can decrypt this DB's page 1 using HMAC-SHA512."""
-    salt = db_page1[:SALT_SZ]
-    # HMAC key derivation: XOR salt with 0x3a, then PBKDF2
-    mac_salt = bytes(b ^ 0x3A for b in salt)
-    mac_key = hashlib.pbkdf2_hmac("sha512", enc_key_bytes, mac_salt, 2, dklen=KEY_SZ)
+    """Verify enc_key can decrypt this DB's page 1.
 
-    # HMAC data: encrypted content + IV
-    hmac_data = db_page1[SALT_SZ : PAGE_SZ - 80 + 16]
+    Tries both SHA512 (SQLCipher 4 default) and SHA1 (SQLCipher 3 legacy)
+    for the MAC key PBKDF2 derivation.
+    """
+    salt = db_page1[:SALT_SZ]
+    mac_salt = bytes(b ^ 0x3A for b in salt)
+
+    # HMAC data: encrypted content + IV (bytes 16..4031), stored HMAC: bytes 4032..4095
+    hmac_data = db_page1[SALT_SZ : PAGE_SZ - 64]
     stored_hmac = db_page1[PAGE_SZ - 64 : PAGE_SZ]
 
-    h = hmac_mod.new(mac_key, hmac_data, hashlib.sha512)
-    h.update(struct.pack("<I", 1))  # page number
-    return h.digest() == stored_hmac
+    for kdf_hash in ("sha512", "sha1"):
+        mac_key = hashlib.pbkdf2_hmac(kdf_hash, enc_key_bytes, mac_salt, 2, dklen=KEY_SZ)
+        h = hmac_mod.new(mac_key, hmac_data, hashlib.sha512)
+        h.update(struct.pack("<I", 1))  # page number
+        if h.digest() == stored_hmac:
+            return True
+    return False
 
 
 def main():
@@ -93,18 +129,7 @@ def main():
     print("  WeChat Memory Scanner - Extract ALL Database Keys")
     print("=" * 60)
 
-    # 1. Collect DB files
-    db_dir = find_db_dir()
-    if not db_dir:
-        print(f"[-] Could not find db_storage directory under {DB_DIR}")
-        sys.exit(1)
-
-    db_files, salt_to_dbs = collect_db_files(db_dir)
-    print(f"\n[*] Found {len(db_files)} databases, {len(salt_to_dbs)} unique salts")
-    for salt_hex, dbs in sorted(salt_to_dbs.items()):
-        print(f"    salt {salt_hex}: {', '.join(dbs)}")
-
-    # 2. Attach to WeChat via lldb
+    # 1. Attach to WeChat first to get PID, then collect DB files for the active account
     print("\n[*] Attaching to WeChat...")
     debugger = lldb.SBDebugger.Create()
     debugger.SetAsync(False)
@@ -121,6 +146,22 @@ def main():
 
     pid = process.GetProcessID()
     print(f"[+] Attached to WeChat (PID: {pid})")
+
+    # 2. Collect DB files from all accounts, active account first
+    db_dirs = find_db_dirs(pid)
+    if not db_dirs:
+        print(f"[-] Could not find db_storage directory under {DB_DIR}")
+        process.Detach()
+        sys.exit(1)
+
+    print(f"[*] Found {len(db_dirs)} db_storage dir(s):")
+    for d in db_dirs:
+        print(f"    {d}")
+
+    db_files, salt_to_dbs = collect_db_files(db_dirs)
+    print(f"\n[*] Found {len(db_files)} databases, {len(salt_to_dbs)} unique salts")
+    for salt_hex, dbs in sorted(salt_to_dbs.items()):
+        print(f"    salt {salt_hex}: {', '.join(dbs)}")
 
     # 3. Enumerate and scan memory regions
     key_map = {}  # salt_hex -> enc_key_hex
@@ -169,7 +210,8 @@ def main():
                 continue
 
             for m in HEX_PATTERN.finditer(data):
-                hex_str = m.group(1).decode()
+                # Normalize to lowercase to avoid case-mismatch with DB salts
+                hex_str = m.group(1).decode().lower()
                 all_hex_matches += 1
                 hex_len = len(hex_str)
 
@@ -270,6 +312,10 @@ def main():
             print(f"  ❌ {rel} (salt={salt_hex})")
 
     result["__salts__"] = sorted(set(result.get("__salts__", [])) | set(key_map.keys()))
+
+    # Store the active db_dir so decrypt_db.py can find the right source files
+    if db_dirs:
+        result["__db_dir__"] = db_dirs[0]
 
     with open(OUTPUT_FILE, "w") as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
